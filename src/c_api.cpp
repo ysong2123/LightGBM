@@ -2060,7 +2060,7 @@ int LGBM_BoosterPredictForCSC(BoosterHandle handle,
   API_END();
 }
 
-int LGBM_BoosterPredictForMat(BoosterHandle handle,
+  int LGBM_BoosterPredictForMat(BoosterHandle handle,
                               const void* data,
                               int data_type,
                               int32_t nrow,
