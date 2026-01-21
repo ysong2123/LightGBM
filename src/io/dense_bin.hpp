@@ -19,6 +19,7 @@ namespace LightGBM {
 
 // Phase 1.1: Enable thread-local histogram accumulation
 // Set to 1 to enable false sharing elimination via thread-local buffers
+// Status: Tested but results show regression - optimization needs refinement
 #define LIGHTGBM_PHASE_1_1_ENABLED 0
 
 /*! \brief Thread-local histogram accumulation pool for Phase 1.1 optimization
@@ -195,6 +196,13 @@ class DenseBin : public Bin {
                                const score_t* ordered_gradients,
                                const score_t* ordered_hessians,
                                hist_t* out) const {
+    // Original implementation - Phase 1.1 optimization deferred
+    // After testing, thread-local buffering with critical merge added overhead
+    // due to clearing costs and synchronization. Future work will explore:
+    // - Smaller thread-local buffers (only used bins)
+    // - Atomic operations for merge
+    // - Better detection of contention scenarios
+
     data_size_t i = start;
     hist_t* grad = out;
     hist_t* hess = out + 1;
