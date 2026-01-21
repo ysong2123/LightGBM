@@ -12,8 +12,55 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+#include <omp.h>
 
 namespace LightGBM {
+
+/*! \brief Thread-local histogram accumulation pool for Phase 1.1 optimization
+ *  Eliminates false sharing in histogram construction by using per-thread buffers
+ */
+class HistogramPool {
+ public:
+  HistogramPool() : is_initialized_(false) {}
+
+  void Init(int num_bins) {
+    if (is_initialized_) return;
+
+    int num_threads = omp_get_max_threads();
+    local_histograms_.resize(num_threads);
+
+    // Allocate per-thread histogram buffer
+    for (int i = 0; i < num_threads; ++i) {
+      local_histograms_[i].resize(num_bins * 2, 0);  // *2 for grad+hess
+    }
+    is_initialized_ = true;
+  }
+
+  std::vector<hist_t>& GetLocalHistogram(int thread_id) {
+    return local_histograms_[thread_id];
+  }
+
+  void Clear() {
+    int num_threads = omp_get_max_threads();
+    for (int i = 0; i < num_threads; ++i) {
+      std::fill(local_histograms_[i].begin(), local_histograms_[i].end(), 0);
+    }
+  }
+
+  void MergeToGlobal(hist_t* global_hist, int num_bins) {
+    int num_threads = omp_get_max_threads();
+    // Merge all thread-local histograms to global
+    for (int t = 0; t < num_threads; ++t) {
+      for (int bin = 0; bin < num_bins * 2; ++bin) {
+        global_hist[bin] += local_histograms_[t][bin];
+      }
+    }
+  }
+
+ private:
+  std::vector<std::vector<hist_t>> local_histograms_;
+  bool is_initialized_;
+};
 
 template <typename VAL_T, bool IS_4BIT>
 class DenseBin;
@@ -94,6 +141,9 @@ class DenseBin : public Bin {
 
   BinIterator* GetIterator(uint32_t min_bin, uint32_t max_bin,
                            uint32_t most_freq_bin) const override;
+
+  // Phase 1.1 Optimization Note: Thread-local accumulation implemented
+  // at call site level in dataset.cpp using local buffers to eliminate false sharing
 
   template <bool USE_INDICES, bool USE_PREFETCH, bool USE_HESSIAN>
   void ConstructHistogramInner(const data_size_t* data_indices,
