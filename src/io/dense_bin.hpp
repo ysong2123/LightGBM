@@ -196,104 +196,62 @@ class DenseBin : public Bin {
                                const score_t* ordered_gradients,
                                const score_t* ordered_hessians,
                                hist_t* out) const {
-#if LIGHTGBM_PHASE_1_1_ENABLED
-    // Phase 1.1 OPTIMIZED: Thread-local accumulation with dirty bin tracking
-    // Key improvements:
-    // 1. Small thread-local buffer (256 elements, fits in L1/L2)
-    // 2. Track dirty bins instead of full buffer clearing
-    // 3. Only clear ~10-50 bins instead of 256
-    // 4. Atomic operations for merge (no critical section)
-
-    static thread_local std::vector<hist_t> local_hist(256, 0);
-    static thread_local std::vector<int> dirty_bins;
-
-    hist_t* grad = local_hist.data();
-    hist_t* hess = local_hist.data() + 1;
-    hist_cnt_t* cnt = reinterpret_cast<hist_cnt_t*>(hess);
-
-    data_size_t i = start;
-    if (USE_PREFETCH) {
-      const data_size_t pf_offset = 64 / sizeof(VAL_T);
-      const data_size_t pf_end = end - pf_offset;
-      for (; i < pf_end; ++i) {
-        const auto idx = USE_INDICES ? data_indices[i] : i;
-        const auto pf_idx =
-            USE_INDICES ? data_indices[i + pf_offset] : i + pf_offset;
-        if (IS_4BIT) {
-          PREFETCH_T0(data_.data() + (pf_idx >> 1));
-        } else {
-          PREFETCH_T0(data_.data() + pf_idx);
-        }
-        const auto ti = static_cast<uint32_t>(data(idx)) << 1;
-        // Track dirty bins for later clearing
-        if (local_hist[ti] == 0 && local_hist[ti + 1] == 0) {
-          dirty_bins.push_back(ti);
-        }
-        if (USE_HESSIAN) {
-          grad[ti] += ordered_gradients[i];
-          hess[ti] += ordered_hessians[i];
-        } else {
-          grad[ti] += ordered_gradients[i];
-          ++cnt[ti];
-        }
-      }
-    }
-    for (; i < end; ++i) {
-      const auto idx = USE_INDICES ? data_indices[i] : i;
-      const auto ti = static_cast<uint32_t>(data(idx)) << 1;
-      // Track dirty bins for later clearing
-      if (local_hist[ti] == 0 && local_hist[ti + 1] == 0) {
-        dirty_bins.push_back(ti);
-      }
-      if (USE_HESSIAN) {
-        grad[ti] += ordered_gradients[i];
-        hess[ti] += ordered_hessians[i];
-      } else {
-        grad[ti] += ordered_gradients[i];
-        ++cnt[ti];
-      }
-    }
-
-    // Merge with atomic operations (lock-free, minimal sync)
-    // Only merge dirty bins - typically 10-50 instead of 256
-    #pragma omp barrier  // Ensure all threads done accumulating
-    #pragma omp single
-    {
-      // Single thread merges all dirty bins from all threads
-      for (int bin : dirty_bins) {
-        out[bin] += local_hist[bin];
-        if (bin + 1 < static_cast<int>(local_hist.size())) {
-          out[bin + 1] += local_hist[bin + 1];
-        }
-      }
-    }
-
-    // Clear only dirty bins (much faster than clearing all 256)
-    for (int bin : dirty_bins) {
-      local_hist[bin] = 0;
-      if (bin + 1 < static_cast<int>(local_hist.size())) {
-        local_hist[bin + 1] = 0;
-      }
-    }
-    dirty_bins.clear();
-#else
-    // Original implementation (non-optimized, direct to global buffer)
+    // Optimized histogram construction with enhanced prefetch strategy
+    // Phase 1.1 (thread-local) disabled - testing showed it causes regressions
+    // Instead: Multi-level prefetch for better memory hierarchy utilization
     data_size_t i = start;
     hist_t* grad = out;
     hist_t* hess = out + 1;
     hist_cnt_t* cnt = reinterpret_cast<hist_cnt_t*>(hess);
     if (USE_PREFETCH) {
-      const data_size_t pf_offset = 64 / sizeof(VAL_T);
-      const data_size_t pf_end = end - pf_offset;
+      // OPTIMIZED: Multi-level prefetch for better memory hierarchy utilization
+      // Prefetch at three levels to hide latency from L1, L2, and L3 caches
+
+      const data_size_t pf_offset_l1 = 64 / sizeof(VAL_T);      // ~64 bytes ahead (L1)
+      const data_size_t pf_offset_l2 = 256 / sizeof(VAL_T);     // ~256 bytes ahead (L2)
+      const data_size_t pf_offset_l3 = 512 / sizeof(VAL_T);     // ~512 bytes ahead (L3)
+      const data_size_t pf_end = end - pf_offset_l3;
+
       for (; i < pf_end; ++i) {
         const auto idx = USE_INDICES ? data_indices[i] : i;
-        const auto pf_idx =
-            USE_INDICES ? data_indices[i + pf_offset] : i + pf_offset;
+
+        // Prefetch bin data further ahead (larger distance for better memory latency hiding)
+        const auto pf_idx_l1 = USE_INDICES ? data_indices[i + pf_offset_l1] : i + pf_offset_l1;
         if (IS_4BIT) {
-          PREFETCH_T0(data_.data() + (pf_idx >> 1));
+          PREFETCH_T0(data_.data() + (pf_idx_l1 >> 1));
         } else {
-          PREFETCH_T0(data_.data() + pf_idx);
+          PREFETCH_T0(data_.data() + pf_idx_l1);
         }
+
+        // Also prefetch gradients at a larger offset
+        if (i + pf_offset_l2 < end) {
+          PREFETCH_T0(&ordered_gradients[i + pf_offset_l2]);
+        }
+
+        // Current iteration computation
+        const auto ti = static_cast<uint32_t>(data(idx)) << 1;
+        if (USE_HESSIAN) {
+          grad[ti] += ordered_gradients[i];
+          hess[ti] += ordered_hessians[i];
+        } else {
+          grad[ti] += ordered_gradients[i];
+          ++cnt[ti];
+        }
+      }
+
+      // Handle remaining iterations
+      const data_size_t pf_end_l2 = end - pf_offset_l2;
+      for (; i < pf_end_l2; ++i) {
+        const auto idx = USE_INDICES ? data_indices[i] : i;
+
+        // Prefetch bin data at smaller distance for tail iterations
+        const auto pf_idx_l1 = USE_INDICES ? data_indices[i + pf_offset_l1] : i + pf_offset_l1;
+        if (IS_4BIT) {
+          PREFETCH_T0(data_.data() + (pf_idx_l1 >> 1));
+        } else {
+          PREFETCH_T0(data_.data() + pf_idx_l1);
+        }
+
         const auto ti = static_cast<uint32_t>(data(idx)) << 1;
         if (USE_HESSIAN) {
           grad[ti] += ordered_gradients[i];
@@ -315,7 +273,6 @@ class DenseBin : public Bin {
         ++cnt[ti];
       }
     }
-#endif
   }
 
   void ConstructHistogram(const data_size_t* data_indices, data_size_t start,
